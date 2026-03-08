@@ -1,0 +1,28 @@
+name: write_tests
+description: "Write developer tests for existing code based on a Jira story"
+applicable_when:
+  story_type: test
+steps:
+  - name: "Identify test targets"
+    agent: repo_agent
+    instruction: "Identify all classes/methods that need test coverage based on the story"
+  - name: "Analyze existing tests"
+    agent: repo_agent
+    instruction: "Find existing test files, understand test patterns, frameworks, and utilities used"
+  - name: "Generate test scenarios"
+    agent: test_agent
+    instruction: |
+      For each target class/method, generate test scenarios covering:
+      - Happy path for each public method
+      - Error/exception cases
+      - Boundary conditions
+      - Null/empty input handling
+      Write scenarios as Gherkin-style Given/When/Then
+  - name: "Write test code"
+    agent: coder_agent
+    instruction: "Convert Gherkin scenarios into actual test code following existing project patterns"
+    loop: true
+    exit_condition: "all_new_tests_pass AND build_passes"
+  - name: "Verify coverage"
+    agent: reviewer_agent
+    instruction: "Run tests with coverage report. Verify all ACs are covered."

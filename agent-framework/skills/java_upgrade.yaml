@@ -1,0 +1,39 @@
+name: java_upgrade
+description: "Upgrade Java version (e.g., Java 11 to Java 17 or Java 21)"
+applicable_when:
+  story_type: upgrade
+  tech_stack_contains: java
+context: |
+  Java upgrade considerations:
+  - Java 17 LTS: Records, sealed classes, pattern matching for instanceof,
+    text blocks, switch expressions, enhanced pseudo-random number generators
+  - Java 21 LTS: Virtual threads, pattern matching for switch, record patterns,
+    sequenced collections, string templates (preview)
+  - Common migration issues:
+    - javax.* to jakarta.* (if also upgrading to Jakarta EE 10)
+    - Removed APIs: Nashorn JS engine, RMI Activation, Applet API
+    - SecurityManager deprecated for removal
+    - Strong encapsulation of JDK internals (--add-opens may be needed)
+    - Updated garbage collector defaults
+steps:
+  - name: "Detect current Java version"
+    agent: repo_agent
+    instruction: "Find current Java version from pom.xml, build.gradle, or JAVA_HOME settings"
+  - name: "Update build config Java version"
+    agent: coder_agent
+    instruction: "Update java.version, sourceCompatibility, targetCompatibility in build config"
+    validation: "build_passes"
+  - name: "Fix removed API usage"
+    agent: coder_agent
+    instruction: "Search for and replace usage of removed/deprecated Java APIs"
+    loop: true
+    exit_condition: "no_compilation_errors AND build_passes"
+  - name: "Update dependencies"
+    agent: coder_agent
+    instruction: "Update library dependencies that require newer versions for Java compatibility"
+    validation: "build_passes"
+  - name: "Run full test suite"
+    agent: test_agent
+    instruction: "Run all tests and fix any failures"
+    loop: true
+    exit_condition: "all_tests_pass"

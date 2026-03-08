@@ -1,0 +1,49 @@
+torri:
+  base_url: "${TORRI_BASE_URL}"
+  api_key: "${TORRI_API_KEY}"
+  model: "${TORRI_MODEL}"
+  max_tokens: 4096
+  temperature: 0
+  timeout_seconds: 120
+  max_retries: 3
+  retry_delay_seconds: 2
+
+jira:
+  base_url: "${JIRA_BASE_URL}"
+  api_token: "${JIRA_API_TOKEN}"
+  username: "${JIRA_USERNAME}"
+
+git:
+  default_remote: "origin"
+  commit_prefix: "[agent]"
+  pr_template: "Agent-generated PR for {jira_id}"
+  provider: "${GIT_PROVIDER}"
+  api_token: "${GIT_API_TOKEN}"
+  api_url: "${GIT_API_URL}"
+
+execution:
+  max_agent_iterations: 25
+  max_build_retries: 5
+  max_test_retries: 5
+  working_directory: "./workspace"
+  command_timeout_seconds: 300
+
+logging:
+  level: "INFO"
+  format: "structured"
+  file: "./logs/agent.log"
+
+perception:
+  max_files_to_scan: 500
+  max_depth: 10
+  ignore_patterns:
+    - "node_modules"
+    - ".git"
+    - "target"
+    - "build"
+    - "dist"
+    - "__pycache__"
+    - ".idea"
+    - ".vscode"
+    - ".gradle"
+    - ".mvn"

@@ -1,0 +1,26 @@
+name: story_implementation
+description: "Implement a Jira story (feature or bug fix)"
+applicable_when:
+  story_type:
+    - feature
+    - bug
+steps:
+  - name: "Analyze requirements"
+    agent: context_agent
+    instruction: "Extract all acceptance criteria and identify edge cases"
+  - name: "Identify affected code"
+    agent: repo_agent
+    instruction: "Find all files and modules that need modification"
+  - name: "Write tests for each AC"
+    agent: test_agent
+    instruction: "Write one or more tests per acceptance criterion. Tests must fail initially."
+    validation: "tests_exist AND tests_fail"
+  - name: "Implement changes"
+    agent: coder_agent
+    instruction: "Write code to satisfy each acceptance criterion. Run build and tests after each change."
+    loop: true
+    exit_condition: "all_tests_pass AND build_passes"
+  - name: "Handle edge cases"
+    agent: coder_agent
+    instruction: "Add error handling, input validation, and edge case coverage identified in step 1"
+    validation: "build_passes AND all_tests_pass"

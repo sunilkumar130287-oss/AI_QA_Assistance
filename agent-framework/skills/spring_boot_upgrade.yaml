@@ -1,0 +1,53 @@
+name: spring_boot_upgrade
+description: "Upgrade Spring Boot to a target version"
+applicable_when:
+  story_type: upgrade
+  tech_stack_contains: spring-boot
+context: |
+  Spring Boot 3.x migration key changes:
+  - Requires Java 17 or higher
+  - Jakarta EE 10: all javax.* packages renamed to jakarta.*
+    - javax.servlet → jakarta.servlet
+    - javax.persistence → jakarta.persistence
+    - javax.validation → jakarta.validation
+    - javax.annotation → jakarta.annotation
+  - Spring Security: WebSecurityConfigurerAdapter removed
+    - Use SecurityFilterChain @Bean instead
+  - Spring MVC: antMatchers() → requestMatchers()
+  - Properties renamed: spring.redis.* → spring.data.redis.*
+  - Actuator endpoints: /actuator/env POST removed
+  - Flyway: minimum version 9.0
+  - Hibernate: 6.x with Jakarta namespace
+  - Removed: spring.factories for auto-configuration
+    (use META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports)
+steps:
+  - name: "Detect current versions"
+    agent: repo_agent
+    instruction: "Find current Spring Boot, Java, and key dependency versions from pom.xml or build.gradle"
+  - name: "Update Java version"
+    agent: coder_agent
+    instruction: "Update Java source/target version to 17+ in build config"
+    validation: "build_passes"
+  - name: "Update Spring Boot parent version"
+    agent: coder_agent
+    instruction: "Update spring-boot-starter-parent version in pom.xml"
+    validation: "build_compiles"
+  - name: "Migrate javax to jakarta"
+    agent: coder_agent
+    instruction: "Replace all javax.* imports with jakarta.* equivalents across all Java files"
+    loop: true
+    exit_condition: "no_javax_imports_remain AND build_passes"
+  - name: "Migrate Spring Security config"
+    agent: coder_agent
+    instruction: "Replace WebSecurityConfigurerAdapter with SecurityFilterChain bean pattern"
+    validation: "build_passes"
+  - name: "Update deprecated APIs"
+    agent: coder_agent
+    instruction: "Replace antMatchers with requestMatchers, update property names"
+    loop: true
+    exit_condition: "no_deprecation_warnings AND build_passes"
+  - name: "Run full test suite"
+    agent: test_agent
+    instruction: "Run all tests, fix any failures caused by the upgrade"
+    loop: true
+    exit_condition: "all_tests_pass"

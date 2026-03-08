@@ -1,0 +1,45 @@
+name: angular_upgrade
+description: "Upgrade Angular to a target version"
+applicable_when:
+  story_type: upgrade
+  tech_stack_contains: angular
+context: |
+  Angular upgrade key patterns:
+  - Use Angular Update Guide (update.angular.io) for version-specific changes
+  - Standalone components (Angular 14+): Can migrate from NgModules
+  - Signals (Angular 16+): New reactive primitive, optional adoption
+  - Control flow (Angular 17+): @if/@for/@switch replaces *ngIf/*ngFor
+  - Defer blocks (Angular 17+): @defer for lazy loading
+  - Common breaking changes per major version:
+    - Removed deprecated APIs
+    - RxJS version requirements
+    - TypeScript version requirements
+    - Zone.js updates
+    - Webpack/esbuild bundler changes
+  - Always update one major version at a time
+steps:
+  - name: "Detect current Angular version"
+    agent: repo_agent
+    instruction: "Read package.json to find current Angular, TypeScript, RxJS versions"
+  - name: "Update Angular CLI and Core"
+    agent: coder_agent
+    instruction: "Update @angular/core, @angular/cli, and related packages in package.json"
+    validation: "npm_install_succeeds"
+  - name: "Update TypeScript version"
+    agent: coder_agent
+    instruction: "Update TypeScript to the version required by the target Angular version"
+    validation: "build_passes"
+  - name: "Update RxJS"
+    agent: coder_agent
+    instruction: "Update RxJS version and migrate deprecated operators"
+    validation: "build_passes"
+  - name: "Fix breaking API changes"
+    agent: coder_agent
+    instruction: "Search for and fix deprecated/removed Angular API usage"
+    loop: true
+    exit_condition: "no_compilation_errors AND build_passes"
+  - name: "Run full test suite"
+    agent: test_agent
+    instruction: "Run ng test and fix failures"
+    loop: true
+    exit_condition: "all_tests_pass"
