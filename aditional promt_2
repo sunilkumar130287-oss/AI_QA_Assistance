@@ -1,0 +1,1460 @@
+# AgentForge v2.1: Three-Layer Dynamic Planning Enhancement — Execution Prompt
+
+> **Instructions:** Copy this entire prompt and paste it into Claude Opus 4.6 along with your full AgentForge codebase (post-v2 implementation). This prompt enhances the existing dynamic skill resolution with a three-layer planning model: deterministic condition evaluation, LLM-powered gap analysis, and plan review. It also refines the ConditionEvaluator to be fully technology-agnostic and strengthens the planner agent's intelligence.
+
+---
+
+## PROMPT START
+
+You are a senior Python architect enhancing the AgentForge framework's planning intelligence. The codebase already has:
+- A `ConditionEvaluator` that evaluates skill YAML conditions against repo context
+- A `PlannerAgent` that resolves skills into execution plans
+- A `ReviewerAgent` with skill-aware review criteria
+- Skill YAML files with conditional steps
+
+You must now implement **three-layer dynamic planning** to handle the full spectrum of migration complexity — from predictable standard upgrades to novel edge cases that no predefined condition could anticipate.
+
+---
+
+## THE THREE-LAYER MODEL
+
+```
+Layer 1: DETERMINISTIC RESOLUTION (no LLM)
+    Skill YAML conditions evaluated against repo context.
+    Fast, reliable, auditable. Handles 80% of decisions.
+
+Layer 2: LLM GAP ANALYSIS (one focused LLM call)
+    Planner LLM reviews the Layer 1 plan + full repo context.
+    Discovers project-specific risks the predefined conditions missed.
+    Adds/modifies steps. Handles the 15% edge cases.
+
+Layer 3: PLAN VALIDATION (one focused LLM call)
+    Independent validation of the combined Layer 1+2 plan.
+    Catches logical conflicts, missing dependencies between steps,
+    and incorrect skip decisions. Handles the final 5%.
+```
+
+**Critical design rule:** Layers 2 and 3 can SUGGEST changes to the plan. They cannot override Layer 1 skip decisions without providing explicit evidence from the repo context. This prevents hallucinated step additions.
+
+---
+
+## GLOBAL RULES FOR THIS ENHANCEMENT
+
+1. **Do not rewrite files that don't need changes.** Only modify the specific modules listed below.
+2. **Layer 1 (deterministic) must work identically to the current implementation.** Don't break it. Layers 2 and 3 are additive.
+3. **Every LLM-suggested plan modification must be tagged with `source: "llm_gap_analysis"` or `source: "llm_validation"`.** This distinguishes them from deterministic decisions in the audit trail.
+4. **The ConditionEvaluator remains fully technology-agnostic.** It knows how to check things. It does not know about Java, Angular, Spring Boot, or any specific technology.
+5. **Backward compatible.** If Layers 2 and 3 are disabled in config, the system behaves exactly as v2.
+
+---
+
+## MODULE 1: REFINE `core/condition_evaluator.py`
+
+The current ConditionEvaluator may have technology-specific knowledge baked into it (like `spring_boot_version_jump_crosses()`). Refactor it to be **purely generic** — all technology knowledge must live in the skill YAML conditions, not in the evaluator.
+
+### 1.1 — Remove any technology-specific functions
+
+**Audit the current implementation.** If any of these exist as built-in functions, remove them and replace with generic equivalents:
+
+```
+REMOVE (technology-specific):
+    spring_boot_version_jump_crosses(ver)
+    has_test_framework(name)  ← only if it hardcodes framework names
+
+KEEP (generic):
+    file_exists(path)
+    file_contains(path, pattern)
+    dependency_exists(name)
+    dependency_version(name)
+    dependency_version_lt(name, ver)
+    dependency_version_gte(name, ver)
+    imports_exist(pattern)
+    import_count(pattern)
+    class_exists(name)
+    method_calls_exist(pattern)
+    annotation_exists(name)
+    property_exists(key)
+    count_files(pattern)
+```
+
+Technology-specific checks that were previously built-in functions become **compound conditions in the skill YAML**:
+
+```yaml
+# BEFORE (technology-specific function in evaluator):
+condition: "spring_boot_version_jump_crosses(3.0)"
+
+# AFTER (generic conditions in skill YAML):
+condition: "dependency_exists('spring-boot-starter') and dependency_version_lt('spring-boot-starter-parent', '3.0.0') and target_framework_version_gte('3.0.0')"
+
+# Or more readably, use a skill-level variable:
+# The skill defines: crossing_3x = current_spring_version < 3.0 and target_spring_version >= 3.0
+condition: "crossing_3x"
+```
+
+### 1.2 — Add skill-level computed variables
+
+Skills should be able to define **computed variables** that combine multiple checks into a named boolean. This keeps individual step conditions readable while the complexity lives in the variable definition.
+
+Add support for a `variables` section in the skill YAML:
+
+```yaml
+# In skill YAML:
+variables:
+  crossing_3x: "dependency_version_lt('spring-boot-starter-parent', '3.0.0')"
+  has_javax_imports: "imports_exist('javax.persistence') or imports_exist('javax.servlet') or imports_exist('javax.validation')"
+  is_multi_module: "module_count > 1"
+  needs_lombok_update: "dependency_exists('lombok') and java_version_jump >= 5"
+
+# Steps reference these variables directly:
+steps:
+  - name: javax to jakarta namespace migration
+    condition: "crossing_3x and has_javax_imports"
+```
+
+**Changes to ConditionEvaluator:**
+
+```python
+class ConditionEvaluator:
+    def __init__(self, repo_context: dict, jira_context: dict, logger):
+        self._repo = repo_context
+        self._jira = jira_context
+        self._log = logger
+        self._custom_variables: dict[str, str] = {}  # skill-defined variables
+
+    def load_skill_variables(self, variables: dict[str, str]) -> None:
+        """Load computed variables defined in a skill YAML.
+
+        Each variable maps a name to a condition expression.
+        When a step condition references this name, it is expanded
+        and evaluated as a sub-condition.
+
+        Args:
+            variables: Dict of variable_name -> condition_expression from skill YAML.
+
+        Raises:
+            ConditionError: If a variable references itself (circular dependency).
+        """
+        # Validate no circular references
+        for name, expr in variables.items():
+            if name in expr:
+                raise ConditionError(f"Circular variable reference: '{name}' references itself")
+        self._custom_variables = variables
+
+    def evaluate(self, condition: str) -> ConditionResult:
+        """Evaluate a condition expression against repo context.
+
+        Resolution order:
+        1. Check if condition is a skill-defined variable name → expand and evaluate
+        2. Check if condition is a comparison (var == value) → resolve variable and compare
+        3. Check if condition is a function call → execute function
+        4. Check if condition is compound (and/or/not) → split and evaluate parts
+        5. Check if condition is a built-in variable name → return its value as bool
+
+        Args:
+            condition: Condition expression string from skill YAML.
+
+        Returns:
+            ConditionResult with result, evidence, and variables used.
+        """
+        condition = condition.strip()
+
+        # Empty or "true" condition → always active
+        if not condition or condition.lower() == "true":
+            return ConditionResult(
+                condition=condition,
+                result=True,
+                evidence="No condition specified — step always runs",
+                variables_used={}
+            )
+
+        # Check if this is a skill-defined variable name
+        if condition in self._custom_variables:
+            expanded = self._custom_variables[condition]
+            self._log.debug(
+                "Expanding skill variable",
+                extra={"variable": condition, "expanded": expanded}
+            )
+            result = self.evaluate(expanded)
+            return ConditionResult(
+                condition=condition,
+                result=result.result,
+                evidence=f"Variable '{condition}' expanded to '{expanded}' → {result.evidence}",
+                variables_used={condition: expanded, **result.variables_used}
+            )
+
+        # Handle compound conditions (and / or / not)
+        # Handle comparisons
+        # Handle function calls
+        # ... (keep existing implementation for these)
+```
+
+### 1.3 — Add `set_variable()` for runtime variables from Jira context
+
+The orchestrator needs to inject runtime variables that come from the Jira story (like target version numbers) into the evaluator. These aren't in the repo context or the skill YAML — they come from user intent.
+
+```python
+def set_runtime_variable(self, name: str, value: Any) -> None:
+    """Set a runtime variable available to all condition evaluations.
+
+    Used for values from Jira context that conditions need but aren't
+    part of the repo context. Examples: target_java_version,
+    target_framework_version, target_spring_version.
+
+    Args:
+        name: Variable name accessible in conditions.
+        value: Variable value (str, int, float, or bool).
+    """
+    self._runtime_variables[name] = value
+    self._log.debug("Runtime variable set", extra={"name": name, "value": value})
+```
+
+Update the variable resolution logic so that when a condition references a variable name, the evaluator checks in this order:
+1. Skill-defined computed variables (`self._custom_variables`)
+2. Runtime variables from Jira context (`self._runtime_variables`)
+3. Repo context fields (`self._repo`)
+4. Built-in variables derived from repo context (like `java_version_jump` = `target_java_version - java_version`)
+
+### 1.4 — Add derived variables
+
+Some variables are computed from the combination of repo context and runtime variables. These shouldn't be in the skill YAML or hardcoded in the evaluator — they're automatically derived:
+
+```python
+def _get_derived_variables(self) -> dict[str, Any]:
+    """Compute derived variables from repo context + runtime variables.
+
+    These are available in conditions without being explicitly defined.
+
+    Returns:
+        Dict of derived variable names and their values.
+    """
+    derived = {}
+
+    # Version jump calculations (generic — works for any version pair)
+    current_java = self._repo.get("java_version")
+    target_java = self._runtime_variables.get("target_java_version")
+    if current_java is not None and target_java is not None:
+        derived["java_version_jump"] = int(target_java) - int(current_java)
+
+    current_angular = self._repo.get("angular_version")
+    target_angular = self._runtime_variables.get("target_angular_version")
+    if current_angular is not None and target_angular is not None:
+        derived["angular_version_jump"] = int(target_angular) - int(current_angular)
+
+    # Generic version jump — works if skill sets "current_version" and "target_version"
+    current = self._runtime_variables.get("current_version")
+    target = self._runtime_variables.get("target_version")
+    if current is not None and target is not None:
+        try:
+            derived["version_jump"] = self._compute_version_jump(current, target)
+            derived["major_version_jump"] = self._compute_major_version_jump(current, target)
+            derived["crosses_major_version"] = derived["major_version_jump"] > 0
+        except (ValueError, TypeError):
+            pass
+
+    return derived
+
+@staticmethod
+def _compute_version_jump(current: str, target: str) -> int:
+    """Compute the integer distance between two semver versions.
+
+    Compares major.minor only. Examples:
+        '2.7.14' → '3.1.0' = 4 (minor versions: 2.7 → 3.1)
+        '11' → '21' = 10
+
+    Args:
+        current: Current version string.
+        target: Target version string.
+
+    Returns:
+        Integer version distance.
+    """
+    ...
+
+@staticmethod
+def _compute_major_version_jump(current: str, target: str) -> int:
+    """Compute the major version distance.
+
+    Examples:
+        '2.7.14' → '3.1.0' = 1
+        '11' → '21' = 10
+        '15.2' → '17.0' = 2
+
+    Args:
+        current: Current version string.
+        target: Target version string.
+
+    Returns:
+        Integer major version distance.
+    """
+    ...
+```
+
+Update the variable resolution chain to include derived variables between runtime and repo context:
+1. Skill-defined computed variables
+2. Runtime variables (from Jira)
+3. Derived variables (computed from runtime + repo)
+4. Repo context fields
+
+Generate the **complete updated `condition_evaluator.py`** with all changes in 1.1 through 1.4.
+
+---
+
+## MODULE 2: ENHANCE `agents/planner_agent.py` — THREE-LAYER PLANNING
+
+This is the biggest change. The planner currently does Layer 1 only. Add Layers 2 and 3.
+
+### 2.1 — Layer 1: Deterministic Resolution (already exists, refine it)
+
+Refine the existing `_resolve_plan()` to output a more structured intermediate result:
+
+```python
+@dataclass(frozen=True)
+class LayerOneResult:
+    """Output of deterministic condition evaluation (Layer 1)."""
+    active_steps: list[ResolvedStep]
+    skipped_steps: list[ResolvedStep]
+    condition_evaluations: list[ConditionResult]
+    variables_snapshot: dict[str, Any]  # All variables and their values at evaluation time
+```
+
+### 2.2 — Layer 2: LLM Gap Analysis (NEW)
+
+After Layer 1 resolves the plan deterministically, Layer 2 sends the plan and full repo context to the LLM for gap analysis.
+
+```python
+def _layer2_gap_analysis(
+    self,
+    layer1_result: LayerOneResult,
+    skill: dict,
+    repo_context: dict,
+    jira_context: dict
+) -> GapAnalysisResult:
+    """Layer 2: LLM-powered gap analysis of the deterministic plan.
+
+    The LLM reviews:
+    1. Active steps — are any unnecessary or missing prerequisites?
+    2. Skipped steps — were any incorrectly skipped given the repo evidence?
+    3. Gaps — are there project-specific risks that no predefined step covers?
+
+    The LLM does NOT re-evaluate conditions. It reviews the DECISIONS that
+    conditions produced, using its broader understanding of software engineering.
+
+    Returns:
+        GapAnalysisResult with suggested modifications and discovered risks.
+    """
+```
+
+**The gap analysis system prompt:**
+
+```python
+_GAP_ANALYSIS_PROMPT = """You are a senior migration architect reviewing an automated execution plan.
+
+## Your Task
+Review the plan below and identify GAPS — things the automated condition evaluation might have missed because they require deeper engineering judgment.
+
+## The Plan
+Skill: {skill_name}
+Task: {jira_summary}
+
+### Active Steps (will execute):
+{active_steps_formatted}
+
+### Skipped Steps (will NOT execute, with reasons):
+{skipped_steps_formatted}
+
+### Repo Context Summary:
+- Build system: {build_system}
+- Language: {language} {language_version}
+- Framework: {framework} {framework_version}
+- Modules: {module_count}
+- Source files: {source_file_count}
+- Test framework: {test_framework}
+- Key dependencies: {top_dependencies}
+- Detected imports of concern: {notable_imports}
+- Annotations in use: {annotations_summary}
+
+### Variables Used in Condition Evaluation:
+{variables_snapshot_formatted}
+
+## What to Look For
+
+1. **Incorrectly skipped steps**: A step was skipped because its condition was false, but you can see evidence in the repo context that it SHOULD run. Provide the specific evidence.
+
+2. **Missing steps**: The skill doesn't have a step for something this specific project needs. For example:
+   - Custom annotation processors that generate code affected by the migration
+   - Internal libraries that wrap deprecated APIs
+   - Build plugins that need version bumps for compatibility
+   - Configuration files in non-standard locations
+   - Multi-module dependency ordering issues
+
+3. **Step ordering risks**: Steps that must run in a specific order but aren't currently ordered correctly.
+
+4. **Unnecessary active steps**: Steps that are active but will have no effect on this project (wasted iterations).
+
+## Response Format
+Respond ONLY with this JSON structure:
+```json
+{{
+    "incorrectly_skipped": [
+        {{
+            "step_name": "Name of the skipped step",
+            "evidence": "Specific repo evidence showing it should be active",
+            "confidence": "high|medium|low"
+        }}
+    ],
+    "missing_steps": [
+        {{
+            "name": "Descriptive step name",
+            "instruction": "What the coder agent should do",
+            "reason": "Why this is needed for this specific project",
+            "insert_after": "Name of existing step this should follow",
+            "confidence": "high|medium|low"
+        }}
+    ],
+    "ordering_issues": [
+        {{
+            "step_name": "Step that needs to move",
+            "should_be_after": "Step it depends on",
+            "reason": "Why this ordering matters"
+        }}
+    ],
+    "unnecessary_active": [
+        {{
+            "step_name": "Step that is active but unnecessary",
+            "reason": "Why it will have no effect"
+        }}
+    ],
+    "overall_risk_assessment": "low|medium|high",
+    "risk_notes": "Brief explanation of overall migration complexity"
+}}
+```
+
+If everything looks correct and you find no gaps, return:
+```json
+{{
+    "incorrectly_skipped": [],
+    "missing_steps": [],
+    "ordering_issues": [],
+    "unnecessary_active": [],
+    "overall_risk_assessment": "low",
+    "risk_notes": "Plan looks complete for this project."
+}}
+```
+"""
+```
+
+**The GapAnalysisResult data structure:**
+
+```python
+@dataclass(frozen=True)
+class GapSuggestion:
+    """A single suggestion from LLM gap analysis."""
+    type: str                # "reactivate_step" | "add_step" | "reorder" | "remove_step"
+    step_name: str           # Affected step name
+    reason: str              # Why the change is suggested
+    evidence: str            # Specific repo evidence
+    confidence: str          # "high" | "medium" | "low"
+    instruction: str | None  # For new steps, what to do
+    insert_after: str | None # For new/reordered steps, positioning
+
+@dataclass(frozen=True)
+class GapAnalysisResult:
+    """Output of Layer 2 LLM gap analysis."""
+    suggestions: list[GapSuggestion]
+    risk_assessment: str     # "low" | "medium" | "high"
+    risk_notes: str
+    raw_llm_response: str    # For audit trail
+```
+
+**Applying gap analysis suggestions:**
+
+```python
+def _apply_gap_analysis(
+    self,
+    layer1_result: LayerOneResult,
+    gap_analysis: GapAnalysisResult,
+    min_confidence: str = "medium"
+) -> LayerOneResult:
+    """Apply LLM gap analysis suggestions to the Layer 1 plan.
+
+    Rules:
+    1. Only apply suggestions with confidence >= min_confidence
+    2. "reactivate_step" moves a step from skipped to active, tagged with source="llm_gap_analysis"
+    3. "add_step" creates a new ResolvedStep, tagged with source="llm_gap_analysis"
+    4. "reorder" changes step ordering within a phase
+    5. "remove_step" moves a step from active to skipped (rare, needs high confidence)
+    6. Every applied suggestion is logged in the audit trail
+
+    Args:
+        layer1_result: The deterministic plan from Layer 1.
+        gap_analysis: LLM suggestions from Layer 2.
+        min_confidence: Minimum confidence to apply a suggestion ("high", "medium", "low").
+
+    Returns:
+        Modified LayerOneResult with gap analysis suggestions applied.
+    """
+    confidence_order = {"high": 3, "medium": 2, "low": 1}
+    min_level = confidence_order.get(min_confidence, 2)
+
+    applied = []
+    rejected = []
+
+    for suggestion in gap_analysis.suggestions:
+        level = confidence_order.get(suggestion.confidence, 0)
+        if level < min_level:
+            rejected.append(suggestion)
+            self._log.info(
+                "Gap analysis suggestion rejected — below confidence threshold",
+                extra={
+                    "step": suggestion.step_name,
+                    "confidence": suggestion.confidence,
+                    "threshold": min_confidence,
+                    "type": suggestion.type,
+                }
+            )
+            continue
+
+        # Apply the suggestion based on type
+        if suggestion.type == "reactivate_step":
+            # Find the step in skipped, move to active
+            ...
+        elif suggestion.type == "add_step":
+            # Create new ResolvedStep with source="llm_gap_analysis"
+            new_step = ResolvedStep(
+                name=suggestion.step_name,
+                agent="coder_agent",
+                instruction=suggestion.instruction,
+                tools_needed=["file_tool", "build_tool", "search_tool"],
+                verify=None,
+                loop=True,
+                max_iterations=10,
+                context=f"LLM-discovered: {suggestion.reason}\nEvidence: {suggestion.evidence}",
+                condition=None,
+                condition_result=None,
+                status="active",
+                skip_reason=None,
+                source="llm_gap_analysis",  # NEW field — tags where this step came from
+            )
+            ...
+        elif suggestion.type == "reorder":
+            ...
+        elif suggestion.type == "remove_step":
+            # Only with high confidence
+            if suggestion.confidence != "high":
+                rejected.append(suggestion)
+                continue
+            ...
+
+        applied.append(suggestion)
+
+    self._log.info(
+        "Gap analysis complete",
+        extra={
+            "applied": len(applied),
+            "rejected": len(rejected),
+            "risk": gap_analysis.risk_assessment,
+        }
+    )
+
+    return modified_result
+```
+
+### 2.3 — Layer 3: Plan Validation (NEW)
+
+An independent LLM call that reviews the combined Layer 1 + Layer 2 plan as a final sanity check. This catches logical conflicts that neither conditions nor gap analysis would find.
+
+```python
+def _layer3_plan_validation(
+    self,
+    combined_plan: ResolvedPlan,
+    skill: dict,
+    repo_context: dict,
+    jira_context: dict
+) -> PlanValidationResult:
+    """Layer 3: Independent validation of the final execution plan.
+
+    This is a separate LLM call with a DIFFERENT system prompt than Layer 2.
+    It acts as a critical reviewer, not a gap finder.
+
+    Checks for:
+    1. Step dependency conflicts (Step B needs Step A's output but A is skipped)
+    2. Logical contradictions (two active steps that would conflict)
+    3. Missing verification steps (active steps without a way to verify success)
+    4. Iteration budget sanity (is max_iterations realistic for the step complexity?)
+    5. Completeness against Jira acceptance criteria
+
+    Returns:
+        PlanValidationResult with warnings and blocking issues.
+    """
+```
+
+**The validation system prompt:**
+
+```python
+_PLAN_VALIDATION_PROMPT = """You are a QA engineer reviewing an automated execution plan BEFORE it runs. Your job is to catch problems that would cause the plan to fail during execution.
+
+## The Final Plan
+{plan_formatted}
+
+## Jira Acceptance Criteria
+{acceptance_criteria_formatted}
+
+## Check These Specific Things
+
+1. **Dependency conflicts**: Does any active step depend on the output of a skipped step? If Step B modifies files that Step A was supposed to create, and Step A is skipped, Step B will fail.
+
+2. **Logical conflicts**: Do any two active steps modify the same files in contradictory ways? For example, one step changes an import to X and another step changes it to Y.
+
+3. **Missing verifications**: Are there active steps that make critical changes but have no `verify` condition? These are risky because failure will be silent.
+
+4. **Iteration budget**: For each active step with loop=true, is the max_iterations budget realistic? A step that modifies 50 files needs more iterations than one that modifies 2.
+
+5. **Acceptance criteria coverage**: Does the plan, if executed successfully, address every acceptance criterion from the Jira story?
+
+6. **Rollback safety**: If the plan fails midway, can the changes be safely reverted with git? Are there any steps that would leave the repo in an unrecoverable state?
+
+## Response Format
+```json
+{{
+    "blocking_issues": [
+        {{
+            "issue": "Description of the problem",
+            "affected_steps": ["Step A", "Step B"],
+            "suggested_fix": "How to resolve this",
+            "severity": "critical|high"
+        }}
+    ],
+    "warnings": [
+        {{
+            "issue": "Description of the concern",
+            "affected_steps": ["Step X"],
+            "suggestion": "What to consider",
+            "severity": "medium|low"
+        }}
+    ],
+    "iteration_adjustments": [
+        {{
+            "step_name": "Step name",
+            "current_budget": 10,
+            "suggested_budget": 25,
+            "reason": "Step modifies 47 files across 3 modules"
+        }}
+    ],
+    "acceptance_criteria_coverage": [
+        {{
+            "criterion": "AC text from Jira",
+            "covered_by_steps": ["Step A", "Step C"],
+            "status": "covered|partially_covered|not_covered"
+        }}
+    ],
+    "overall_assessment": "ready|needs_fixes|high_risk",
+    "notes": "Brief summary"
+}}
+```
+"""
+```
+
+**PlanValidationResult:**
+
+```python
+@dataclass(frozen=True)
+class BlockingIssue:
+    issue: str
+    affected_steps: list[str]
+    suggested_fix: str
+    severity: str
+
+@dataclass(frozen=True)
+class ValidationWarning:
+    issue: str
+    affected_steps: list[str]
+    suggestion: str
+    severity: str
+
+@dataclass(frozen=True)
+class IterationAdjustment:
+    step_name: str
+    current_budget: int
+    suggested_budget: int
+    reason: str
+
+@dataclass(frozen=True)
+class CriteriaCoverage:
+    criterion: str
+    covered_by_steps: list[str]
+    status: str  # "covered" | "partially_covered" | "not_covered"
+
+@dataclass(frozen=True)
+class PlanValidationResult:
+    blocking_issues: list[BlockingIssue]
+    warnings: list[ValidationWarning]
+    iteration_adjustments: list[IterationAdjustment]
+    criteria_coverage: list[CriteriaCoverage]
+    overall_assessment: str  # "ready" | "needs_fixes" | "high_risk"
+    notes: str
+    raw_llm_response: str
+```
+
+### 2.4 — Handling blocking issues from Layer 3
+
+If Layer 3 finds blocking issues:
+
+```python
+def _handle_validation_issues(
+    self,
+    plan: ResolvedPlan,
+    validation: PlanValidationResult
+) -> ResolvedPlan:
+    """Handle blocking issues and warnings from plan validation.
+
+    For blocking issues:
+    - If severity is "critical": attempt to auto-fix by adjusting the plan
+        - Dependency conflicts: reactivate the skipped dependency step
+        - Logical conflicts: reorder steps or add a guard
+        - If auto-fix not possible: flag for human review
+    - If severity is "high": log warning and proceed with caution flag
+
+    For iteration adjustments:
+    - Apply suggested budget increases (cap at 50 iterations per step)
+
+    For uncovered acceptance criteria:
+    - Add a note to the coder agent's context for the nearest relevant step
+    - If no relevant step exists, add a generic implementation step
+
+    Returns:
+        Adjusted ResolvedPlan with validation issues addressed.
+    """
+```
+
+### 2.5 — The unified planning flow
+
+Tie all three layers together:
+
+```python
+def run(self, task_context: dict) -> AgentResult:
+    """Execute three-layer planning.
+
+    Flow:
+    1. Load skill + variables
+    2. Layer 1: Deterministic condition evaluation
+    3. Layer 2: LLM gap analysis (if enabled in config)
+    4. Merge Layer 1 + Layer 2
+    5. Build ResolvedPlan
+    6. Layer 3: LLM plan validation (if enabled in config)
+    7. Handle validation issues
+    8. Output final ResolvedPlan to state manager
+
+    Config controls:
+        agents.planner.enable_gap_analysis: true/false (default: true)
+        agents.planner.enable_plan_validation: true/false (default: true)
+        agents.planner.gap_analysis_min_confidence: "high"|"medium"|"low" (default: "medium")
+    """
+    skill = task_context["skill"]
+    repo_context = task_context["repo_context"]
+    jira_context = task_context["jira_context"]
+
+    # Load skill-defined variables into evaluator
+    if "variables" in skill:
+        self._evaluator.load_skill_variables(skill["variables"])
+
+    # LAYER 1: Deterministic resolution
+    self._log.info("Planning Layer 1: Deterministic condition evaluation")
+    layer1 = self._layer1_deterministic_resolution(skill, repo_context, jira_context)
+    self._log.info(
+        "Layer 1 complete",
+        extra={"active": len(layer1.active_steps), "skipped": len(layer1.skipped_steps)}
+    )
+
+    # LAYER 2: LLM gap analysis
+    combined_active = list(layer1.active_steps)
+    combined_skipped = list(layer1.skipped_steps)
+
+    if self._config.get("enable_gap_analysis", True):
+        self._log.info("Planning Layer 2: LLM gap analysis")
+        gap_result = self._layer2_gap_analysis(layer1, skill, repo_context, jira_context)
+
+        if gap_result.suggestions:
+            self._log.info(
+                "Gap analysis found suggestions",
+                extra={
+                    "count": len(gap_result.suggestions),
+                    "risk": gap_result.risk_assessment,
+                }
+            )
+            modified = self._apply_gap_analysis(
+                layer1,
+                gap_result,
+                min_confidence=self._config.get("gap_analysis_min_confidence", "medium")
+            )
+            combined_active = modified.active_steps
+            combined_skipped = modified.skipped_steps
+    else:
+        gap_result = None
+
+    # Build the ResolvedPlan from combined results
+    plan = self._build_resolved_plan(skill, combined_active, combined_skipped, layer1, gap_result)
+
+    # LAYER 3: Plan validation
+    if self._config.get("enable_plan_validation", True):
+        self._log.info("Planning Layer 3: LLM plan validation")
+        validation = self._layer3_plan_validation(plan, skill, repo_context, jira_context)
+
+        if validation.blocking_issues:
+            self._log.warning(
+                "Plan validation found blocking issues",
+                extra={"count": len(validation.blocking_issues)}
+            )
+            plan = self._handle_validation_issues(plan, validation)
+
+        if validation.iteration_adjustments:
+            plan = self._apply_iteration_adjustments(plan, validation.iteration_adjustments)
+
+        # Save validation result to state
+        self._state.set("planner", "validation_result", {
+            "blocking_issues": [asdict(i) for i in validation.blocking_issues],
+            "warnings": [asdict(w) for w in validation.warnings],
+            "criteria_coverage": [asdict(c) for c in validation.criteria_coverage],
+            "overall_assessment": validation.overall_assessment,
+        })
+    else:
+        validation = None
+
+    # Save complete planning audit trail
+    self._state.set("planner", "planning_audit", {
+        "layer1_active": len(layer1.active_steps),
+        "layer1_skipped": len(layer1.skipped_steps),
+        "layer2_applied": len(gap_result.suggestions) if gap_result else 0,
+        "layer2_risk": gap_result.risk_assessment if gap_result else "n/a",
+        "layer3_blocking": len(validation.blocking_issues) if validation else 0,
+        "layer3_assessment": validation.overall_assessment if validation else "n/a",
+        "final_active": plan.total_active_steps,
+        "final_skipped": plan.total_skipped_steps,
+    })
+
+    self._log.info(
+        "Planning complete — all layers",
+        extra={
+            "final_active_steps": plan.total_active_steps,
+            "final_skipped_steps": plan.total_skipped_steps,
+            "gap_analysis_risk": gap_result.risk_assessment if gap_result else "disabled",
+            "validation_assessment": validation.overall_assessment if validation else "disabled",
+        }
+    )
+
+    return AgentResult(
+        status="complete",
+        output=asdict(plan),
+        iterations=1,
+        tool_calls=[],
+        token_usage=self._llm.get_usage_stats(),
+    )
+```
+
+### 2.6 — Update ResolvedStep to include source tracking
+
+```python
+@dataclass(frozen=True)
+class ResolvedStep:
+    name: str
+    agent: str
+    instruction: str
+    tools_needed: list[str]
+    verify: str | None
+    loop: bool
+    max_iterations: int
+    context: str
+    condition: str | None
+    condition_result: ConditionResult | None
+    status: str                   # "active" | "skipped"
+    skip_reason: str | None
+    source: str                   # NEW: "skill_condition" | "llm_gap_analysis" | "llm_validation" | "always_run"
+    gap_analysis_evidence: str | None  # NEW: evidence if reactivated/added by Layer 2
+    confidence: str | None        # NEW: confidence level if from Layer 2/3
+```
+
+Generate the **complete updated `planner_agent.py`** with all three layers fully implemented.
+
+---
+
+## MODULE 3: UPDATE SKILL YAML FILES
+
+### 3.1 — Add `variables` section to all skill files
+
+Update every skill YAML to use computed variables for readability.
+
+**`skills/java_upgrade.yaml`** — Add:
+```yaml
+variables:
+  needs_javax_xml_migration: "imports_exist('javax.xml.bind') and java_version_jump >= 0 and target_java_version >= 11"
+  needs_nashorn_migration: "imports_exist('jdk.nashorn') or imports_exist('javax.script') and target_java_version >= 15"
+  needs_security_manager_update: "class_exists('SecurityManager') and target_java_version >= 17"
+  needs_unsafe_migration: "imports_exist('sun.misc.Unsafe') or imports_exist('sun.misc.Cleaner')"
+  needs_lombok_update: "dependency_exists('lombok') and java_version_jump >= 5"
+  needs_junit_update: "dependency_exists('junit') and not dependency_exists('junit-jupiter')"
+  is_multi_module: "module_count > 1"
+  has_reflection_access: "imports_exist('java.lang.reflect') and target_java_version >= 16"
+  can_use_text_blocks: "target_java_version >= 15"
+  can_use_records: "target_java_version >= 16"
+  can_use_sealed_classes: "target_java_version >= 17"
+  can_use_pattern_matching: "target_java_version >= 21"
+  can_use_virtual_threads: "target_java_version >= 21"
+```
+
+Update all step conditions to reference these variables instead of inline expressions.
+
+**`skills/spring_boot_upgrade.yaml`** — Add:
+```yaml
+variables:
+  crossing_3x: "dependency_version_lt('spring-boot-starter-parent', '3.0.0')"
+  has_javax_persistence: "imports_exist('javax.persistence')"
+  has_javax_servlet: "imports_exist('javax.servlet')"
+  has_javax_validation: "imports_exist('javax.validation')"
+  has_javax_imports: "has_javax_persistence or has_javax_servlet or has_javax_validation"
+  has_web_security_configurer: "class_exists('WebSecurityConfigurerAdapter')"
+  has_old_actuator_config: "property_exists('management.endpoints.web.exposure.include')"
+  uses_spring_data_jpa: "dependency_exists('spring-boot-starter-data-jpa')"
+  uses_spring_security: "dependency_exists('spring-boot-starter-security')"
+  uses_spring_cloud: "dependency_exists('spring-cloud-dependencies')"
+```
+
+**`skills/angular_upgrade.yaml`** — Add:
+```yaml
+variables:
+  crossing_15: "angular_version < 15 and target_angular_version >= 15"
+  crossing_16: "angular_version < 16 and target_angular_version >= 16"
+  crossing_17: "angular_version < 17 and target_angular_version >= 17"
+  crossing_18: "angular_version < 18 and target_angular_version >= 18"
+  has_ng_modules: "file_contains('**/*.module.ts', '@NgModule')"
+  has_old_rxjs: "dependency_version_lt('rxjs', '7.0')"
+  uses_karma: "dependency_exists('karma')"
+  uses_protractor: "dependency_exists('protractor')"
+  has_old_http_module: "imports_exist('@angular/common/http') and imports_exist('HttpClientModule')"
+```
+
+**`skills/story_implementation.yaml`** and **`skills/test_generation.yaml`** — Add appropriate variables.
+
+Generate **all 5 updated skill YAML files** with variables sections and updated step conditions.
+
+---
+
+## MODULE 4: UPDATE `core/orchestrator.py`
+
+Wire the three-layer planning into the orchestrator:
+
+### 4.1 — Inject runtime variables from Jira context
+
+After the context agent extracts the Jira story, parse any version targets and inject them into the ConditionEvaluator:
+
+```python
+# After context agent completes
+jira_context = self._state.get("context_agent", "jira_context")
+
+# Extract version targets from Jira context (the context agent should parse these)
+version_mappings = {
+    "target_java_version": jira_context.get("target_java_version"),
+    "target_angular_version": jira_context.get("target_angular_version"),
+    "target_spring_version": jira_context.get("target_spring_version"),
+    "target_version": jira_context.get("target_version"),  # Generic
+    "current_version": None,  # Will be set after repo analysis
+}
+
+# After repo agent completes
+repo_context = self._state.get("repo_agent", "repo_context")
+
+# Set current versions from repo analysis
+version_mappings["current_version"] = repo_context.get("framework_version")
+
+# Create evaluator with all context
+condition_evaluator = ConditionEvaluator(repo_context, jira_context, self._log)
+for name, value in version_mappings.items():
+    if value is not None:
+        condition_evaluator.set_runtime_variable(name, value)
+```
+
+### 4.2 — Pass configuration to planner for layer toggles
+
+```python
+planner_config = {
+    "enable_gap_analysis": self._config.get("agents", {}).get("planner", {}).get("enable_gap_analysis", True),
+    "enable_plan_validation": self._config.get("agents", {}).get("planner", {}).get("enable_plan_validation", True),
+    "gap_analysis_min_confidence": self._config.get("agents", {}).get("planner", {}).get("gap_analysis_min_confidence", "medium"),
+}
+```
+
+### 4.3 — Log planning summary with layer breakdown
+
+After the planner completes, log a clear summary:
+
+```python
+planning_audit = self._state.get("planner", "planning_audit")
+self._log.info(
+    "=" * 60 + "\n"
+    f"PLAN SUMMARY FOR {user_input['jira_id']}\n"
+    f"Skill: {skill['name']}\n"
+    f"Layer 1 (deterministic): {planning_audit['layer1_active']} active, {planning_audit['layer1_skipped']} skipped\n"
+    f"Layer 2 (gap analysis): {planning_audit['layer2_applied']} modifications, risk={planning_audit['layer2_risk']}\n"
+    f"Layer 3 (validation): {planning_audit['layer3_blocking']} blocking issues, assessment={planning_audit['layer3_assessment']}\n"
+    f"FINAL: {planning_audit['final_active']} steps to execute, {planning_audit['final_skipped']} skipped\n"
+    + "=" * 60
+)
+```
+
+Generate the **complete updated `orchestrator.py`**.
+
+---
+
+## MODULE 5: UPDATE `agents/context_agent.py`
+
+The context agent needs to extract version targets from the Jira story more reliably.
+
+### 5.1 — Add version target extraction
+
+The context agent's system prompt should instruct it to extract specific version targets:
+
+```python
+_VERSION_EXTRACTION_ADDITION = """
+When analyzing the Jira story, also extract any VERSION TARGETS mentioned:
+- Target Java version (e.g., "upgrade to Java 21" → target_java_version: 21)
+- Target Spring Boot version (e.g., "migrate to Spring Boot 3.2" → target_spring_version: "3.2.0")
+- Target Angular version (e.g., "upgrade Angular to v17" → target_angular_version: 17)
+- Generic target version (for any other framework/library)
+
+Include these in your output as:
+```json
+{
+    "target_java_version": 21,
+    "target_spring_version": "3.2.0",
+    "target_angular_version": null,
+    "target_version": "3.2.0"
+}
+```
+
+If a version target is not mentioned in the story, set it to null.
+If the story says "latest" or "current LTS", note this and set to null — the planner will resolve it.
+"""
+```
+
+### 5.2 — Parse version from story description patterns
+
+Add helper to handle common Jira patterns:
+
+```python
+def _extract_version_targets(self, story_text: str) -> dict[str, Any]:
+    """Extract version targets from Jira story text.
+
+    Handles patterns like:
+    - "Upgrade to Java 21"
+    - "Migrate Spring Boot from 2.7 to 3.2"
+    - "Update Angular to version 17"
+    - "Upgrade to latest LTS"
+
+    Args:
+        story_text: Combined title + description from Jira.
+
+    Returns:
+        Dict with target version fields, None for undetected.
+    """
+```
+
+Generate the **complete updated `context_agent.py`**.
+
+---
+
+## MODULE 6: UPDATE `config/settings.yaml`
+
+Add the new planner configuration:
+
+```yaml
+agents:
+  planner:
+    enable_gap_analysis: true
+    enable_plan_validation: true
+    gap_analysis_min_confidence: "medium"  # "high" = conservative, "low" = aggressive
+    max_gap_analysis_suggestions: 5        # Cap on new steps from Layer 2
+
+  coder:
+    max_iterations: 30
+    default_step_iterations: 10
+
+  reviewer:
+    max_review_cycles: 2
+```
+
+Generate the **complete updated `settings.yaml`**.
+
+---
+
+## MODULE 7: NEW TESTS
+
+### 7.1 — `tests/test_three_layer_planning.py`
+
+```python
+"""Tests for the three-layer planning model."""
+
+class TestLayerOneDeterministic:
+    """Layer 1: Verify deterministic condition evaluation produces correct plans."""
+
+    def test_simple_project_minimal_steps(self, planner, simple_java_context):
+        """Simple microservice with no deprecated APIs → only build config + verify."""
+        result = planner._layer1_deterministic_resolution(java_skill, simple_java_context, jira_11_to_21)
+        assert len(result.active_steps) <= 4
+        assert len(result.skipped_steps) >= 8
+        # Specific steps that should be active
+        active_names = {s.name for s in result.active_steps}
+        assert "Update Maven compiler plugin" in active_names
+        assert "Full build and test" in active_names
+        # Specific steps that should be skipped
+        skipped_names = {s.name for s in result.skipped_steps}
+        assert "Replace removed javax.xml APIs" in skipped_names
+
+    def test_complex_monolith_many_steps(self, planner, complex_java_context):
+        """Monolith with javax imports, Lombok, old JUnit → most steps active."""
+        result = planner._layer1_deterministic_resolution(java_skill, complex_java_context, jira_11_to_21)
+        assert len(result.active_steps) >= 8
+        active_names = {s.name for s in result.active_steps}
+        assert "Replace removed javax.xml APIs" in active_names
+        assert "Update Lombok version" in active_names
+
+    def test_skill_variables_expand_correctly(self, planner, evaluator):
+        """Skill-defined variables are expanded before evaluation."""
+        evaluator.load_skill_variables({
+            "needs_lombok_update": "dependency_exists('lombok') and java_version_jump >= 5"
+        })
+        result = evaluator.evaluate("needs_lombok_update")
+        assert result.evidence  # Should explain the expansion
+        assert "lombok" in result.evidence.lower() or "needs_lombok_update" in result.evidence
+
+    def test_runtime_variables_from_jira(self, planner, evaluator):
+        """Runtime variables from Jira context are available in conditions."""
+        evaluator.set_runtime_variable("target_java_version", 21)
+        result = evaluator.evaluate("target_java_version >= 17")
+        assert result.result is True
+
+    def test_derived_variables_computed(self, planner, evaluator):
+        """Derived variables like java_version_jump are automatically computed."""
+        evaluator.set_runtime_variable("target_java_version", 21)
+        # Assuming repo context has java_version=11
+        result = evaluator.evaluate("java_version_jump >= 5")
+        assert result.result is True  # 21-11=10 >= 5
+
+
+class TestLayerTwoGapAnalysis:
+    """Layer 2: Verify LLM gap analysis works correctly."""
+
+    def test_gap_analysis_called_when_enabled(self, planner, mock_llm):
+        """Gap analysis LLM call is made when config enables it."""
+        planner._config["enable_gap_analysis"] = True
+        mock_llm.return_value = '{"incorrectly_skipped": [], "missing_steps": [], "ordering_issues": [], "unnecessary_active": [], "overall_risk_assessment": "low", "risk_notes": "Looks good."}'
+        plan = planner.run(task_context)
+        assert mock_llm.call_count >= 1  # At least one call for gap analysis
+
+    def test_gap_analysis_skipped_when_disabled(self, planner, mock_llm):
+        """No gap analysis LLM call when config disables it."""
+        planner._config["enable_gap_analysis"] = False
+        plan = planner.run(task_context)
+        # LLM should only be called for Layer 3 or not at all
+        gap_calls = [c for c in mock_llm.call_args_list if "gap" in str(c).lower()]
+        assert len(gap_calls) == 0
+
+    def test_high_confidence_suggestions_applied(self, planner, mock_llm):
+        """High confidence gap analysis suggestions are applied to the plan."""
+        mock_llm.return_value = json.dumps({
+            "incorrectly_skipped": [{
+                "step_name": "Replace removed javax.xml APIs",
+                "evidence": "Found javax.xml.bind usage in generated code from annotation processor",
+                "confidence": "high"
+            }],
+            "missing_steps": [],
+            "ordering_issues": [],
+            "unnecessary_active": [],
+            "overall_risk_assessment": "medium",
+            "risk_notes": "Annotation processor generates javax code"
+        })
+        plan = planner.run(task_context)
+        active_names = {s.name for p in plan.phases for s in p.steps if s.status == "active"}
+        assert "Replace removed javax.xml APIs" in active_names
+
+    def test_low_confidence_suggestions_rejected_at_medium_threshold(self, planner, mock_llm):
+        """Low confidence suggestions are rejected when min_confidence is medium."""
+        planner._config["gap_analysis_min_confidence"] = "medium"
+        mock_llm.return_value = json.dumps({
+            "incorrectly_skipped": [{
+                "step_name": "Some step",
+                "evidence": "Might be needed",
+                "confidence": "low"
+            }],
+            "missing_steps": [],
+            "ordering_issues": [],
+            "unnecessary_active": [],
+            "overall_risk_assessment": "low",
+            "risk_notes": "Minor"
+        })
+        plan = planner.run(task_context)
+        audit = planner._state.get("planner", "planning_audit")
+        assert audit["layer2_applied"] == 0
+
+    def test_llm_added_steps_tagged_with_source(self, planner, mock_llm):
+        """Steps added by gap analysis are tagged with source='llm_gap_analysis'."""
+        mock_llm.return_value = json.dumps({
+            "incorrectly_skipped": [],
+            "missing_steps": [{
+                "name": "Update annotation processor config",
+                "instruction": "Update the annotation processor to generate jakarta imports",
+                "reason": "Custom annotation processor generates javax code",
+                "insert_after": "Update Maven compiler plugin",
+                "confidence": "high"
+            }],
+            "ordering_issues": [],
+            "unnecessary_active": [],
+            "overall_risk_assessment": "medium",
+            "risk_notes": ""
+        })
+        plan = planner.run(task_context)
+        llm_steps = [s for p in plan.phases for s in p.steps if s.source == "llm_gap_analysis"]
+        assert len(llm_steps) == 1
+        assert llm_steps[0].name == "Update annotation processor config"
+
+
+class TestLayerThreeValidation:
+    """Layer 3: Verify plan validation catches issues."""
+
+    def test_dependency_conflict_detected(self, planner, mock_llm_validator):
+        """Validator catches when an active step depends on a skipped step's output."""
+        mock_llm_validator.return_value = json.dumps({
+            "blocking_issues": [{
+                "issue": "Step 'Fix jakarta imports' depends on 'Namespace migration' which is skipped",
+                "affected_steps": ["Fix jakarta imports", "Namespace migration"],
+                "suggested_fix": "Reactivate 'Namespace migration'",
+                "severity": "critical"
+            }],
+            "warnings": [],
+            "iteration_adjustments": [],
+            "acceptance_criteria_coverage": [],
+            "overall_assessment": "needs_fixes",
+            "notes": ""
+        })
+        plan = planner.run(task_context)
+        # The blocking issue should trigger auto-fix
+        active_names = {s.name for p in plan.phases for s in p.steps if s.status == "active"}
+        assert "Namespace migration" in active_names  # Should have been reactivated
+
+    def test_iteration_budget_adjusted(self, planner, mock_llm_validator):
+        """Validator's iteration budget suggestions are applied."""
+        mock_llm_validator.return_value = json.dumps({
+            "blocking_issues": [],
+            "warnings": [],
+            "iteration_adjustments": [{
+                "step_name": "Update Maven compiler plugin",
+                "current_budget": 10,
+                "suggested_budget": 25,
+                "reason": "Multi-module project with 12 pom.xml files"
+            }],
+            "acceptance_criteria_coverage": [],
+            "overall_assessment": "ready",
+            "notes": ""
+        })
+        plan = planner.run(task_context)
+        step = next(s for p in plan.phases for s in p.steps if s.name == "Update Maven compiler plugin")
+        assert step.max_iterations == 25
+
+    def test_uncovered_acceptance_criteria_flagged(self, planner, mock_llm_validator):
+        """Validator flags acceptance criteria not covered by any step."""
+        mock_llm_validator.return_value = json.dumps({
+            "blocking_issues": [],
+            "warnings": [{
+                "issue": "AC 'Verify backward compatibility with Java 11 clients' is not covered by any step",
+                "affected_steps": [],
+                "suggestion": "Add a backward compatibility verification step",
+                "severity": "medium"
+            }],
+            "iteration_adjustments": [],
+            "acceptance_criteria_coverage": [{
+                "criterion": "Verify backward compatibility with Java 11 clients",
+                "covered_by_steps": [],
+                "status": "not_covered"
+            }],
+            "overall_assessment": "ready",
+            "notes": ""
+        })
+        plan = planner.run(task_context)
+        validation = planner._state.get("planner", "validation_result")
+        uncovered = [c for c in validation["criteria_coverage"] if c["status"] == "not_covered"]
+        assert len(uncovered) >= 1
+
+
+class TestSkillVariables:
+    """Test skill-defined computed variables."""
+
+    def test_simple_variable(self, evaluator_with_java_repo):
+        """Simple variable references a single condition."""
+        evaluator_with_java_repo.load_skill_variables({
+            "uses_lombok": "dependency_exists('lombok')"
+        })
+        result = evaluator_with_java_repo.evaluate("uses_lombok")
+        assert isinstance(result.result, bool)
+        assert "lombok" in result.evidence.lower()
+
+    def test_compound_variable(self, evaluator_with_java_repo):
+        """Variable combining multiple conditions."""
+        evaluator_with_java_repo.load_skill_variables({
+            "needs_full_migration": "imports_exist('javax.xml.bind') and dependency_exists('lombok') and module_count > 1"
+        })
+        result = evaluator_with_java_repo.evaluate("needs_full_migration")
+        assert isinstance(result.result, bool)
+
+    def test_variable_referencing_variable(self, evaluator_with_java_repo):
+        """One variable can reference another skill variable."""
+        evaluator_with_java_repo.load_skill_variables({
+            "has_javax": "imports_exist('javax.xml.bind')",
+            "needs_javax_migration": "has_javax and java_version_jump >= 6"
+        })
+        result = evaluator_with_java_repo.evaluate("needs_javax_migration")
+        assert isinstance(result.result, bool)
+
+    def test_circular_variable_rejected(self, evaluator_with_java_repo):
+        """Circular variable references are caught and raise an error."""
+        with pytest.raises(ConditionError, match="[Cc]ircular"):
+            evaluator_with_java_repo.load_skill_variables({
+                "var_a": "var_b and file_exists('pom.xml')",
+                "var_b": "var_a and dependency_exists('lombok')"
+            })
+
+    def test_undefined_variable_returns_false(self, evaluator_with_java_repo):
+        """Referencing an undefined variable returns False with a warning."""
+        result = evaluator_with_java_repo.evaluate("nonexistent_variable")
+        assert result.result is False
+
+
+class TestEndToEndPlanning:
+    """End-to-end tests for the full three-layer planning pipeline."""
+
+    def test_java_11_to_21_simple_microservice(self, full_planner, simple_java_context, jira_context):
+        """Simple microservice: Layer 1 handles everything, Layers 2+3 find nothing."""
+        result = full_planner.run({
+            "skill": load_skill("java_upgrade"),
+            "repo_context": simple_java_context,
+            "jira_context": {**jira_context, "target_java_version": 21},
+        })
+        plan = result.output
+        assert plan["total_active_steps"] <= 4
+        assert plan["total_skipped_steps"] >= 8
+        audit = full_planner._state.get("planner", "planning_audit")
+        assert audit["layer2_applied"] == 0  # No gap analysis changes needed
+
+    def test_spring_boot_2_to_3_complex_monolith(self, full_planner, complex_spring_context, jira_context):
+        """Complex monolith: Layer 1 activates most steps, Layer 2 may find extras."""
+        result = full_planner.run({
+            "skill": load_skill("spring_boot_upgrade"),
+            "repo_context": complex_spring_context,
+            "jira_context": {**jira_context, "target_spring_version": "3.2.0", "target_java_version": 21},
+        })
+        plan = result.output
+        # Should have many active steps for a complex Spring Boot migration
+        assert plan["total_active_steps"] >= 10
+        # Should include both Java and Spring-specific steps (inheritance)
+        step_names = [s["name"] for p in plan["phases"] for s in p["steps"] if s["status"] == "active"]
+        # Java steps
+        assert any("compiler" in n.lower() or "maven" in n.lower() for n in step_names)
+        # Spring steps
+        assert any("jakarta" in n.lower() or "namespace" in n.lower() for n in step_names)
+
+    def test_layers_disabled_falls_back_to_deterministic_only(self, planner, simple_java_context, jira_context):
+        """With Layers 2+3 disabled, plan is purely deterministic."""
+        planner._config["enable_gap_analysis"] = False
+        planner._config["enable_plan_validation"] = False
+        result = planner.run({
+            "skill": load_skill("java_upgrade"),
+            "repo_context": simple_java_context,
+            "jira_context": {**jira_context, "target_java_version": 21},
+        })
+        audit = planner._state.get("planner", "planning_audit")
+        assert audit["layer2_applied"] == 0
+        assert audit["layer2_risk"] == "n/a"
+        assert audit["layer3_blocking"] == 0
+        assert audit["layer3_assessment"] == "n/a"
+```
+
+Generate **complete test files** with all tests implemented including fixtures and mock data.
+
+---
+
+## MODULE 8: UPDATE `agents/reviewer_agent.py`
+
+One addition to the reviewer: it should call out **which steps came from LLM gap analysis** and pay extra scrutiny to those.
+
+```python
+# Add to the review prompt assembly:
+llm_steps = [s for p in resolved_plan.phases for s in p.steps
+             if s.status == "active" and s.source == "llm_gap_analysis"]
+if llm_steps:
+    sections.append("\n## LLM-Discovered Steps — EXTRA SCRUTINY REQUIRED\n")
+    sections.append(
+        "The following steps were NOT in the original skill but were added by "
+        "the AI gap analysis. Review these with extra care — verify the evidence "
+        "justifies their inclusion and that they didn't introduce unintended changes.\n"
+    )
+    for step in llm_steps:
+        sections.append(f"- {step.name}")
+        sections.append(f"  Evidence: {step.gap_analysis_evidence}")
+        sections.append(f"  Confidence: {step.confidence}")
+```
+
+Also add to the review JSON output schema:
+
+```json
+{
+    "llm_discovered_steps_review": [
+        {
+            "step_name": "Step added by gap analysis",
+            "justified": true,
+            "evidence_valid": true,
+            "changes_appropriate": true,
+            "notes": "The annotation processor concern was valid"
+        }
+    ]
+}
+```
+
+Generate the **complete updated `reviewer_agent.py`**.
+
+---
+
+## FINAL VERIFICATION
+
+After generating all files, output:
+
+```
+✅ AgentForge v2.1 — Three-Layer Dynamic Planning Complete
+
+ARCHITECTURE:
+  Layer 1 (Deterministic): Skill YAML conditions → ConditionEvaluator → active/skipped
+  Layer 2 (Gap Analysis):  LLM reviews Layer 1 plan → discovers edge cases → suggests modifications
+  Layer 3 (Validation):    LLM validates combined plan → catches conflicts → adjusts budgets
+
+MODIFIED FILES:
+  - core/condition_evaluator.py — Generic engine, skill variables, runtime variables, derived variables
+  - agents/planner_agent.py — Three-layer planning with gap analysis and validation
+  - agents/reviewer_agent.py — Extra scrutiny for LLM-discovered steps
+  - agents/context_agent.py — Version target extraction from Jira
+  - core/orchestrator.py — Runtime variable injection, layer configuration
+  - config/settings.yaml — Planner layer toggles and thresholds
+
+UPDATED SKILLS:
+  - skills/java_upgrade.yaml — Added variables section, updated conditions
+  - skills/spring_boot_upgrade.yaml — Added variables section, updated conditions
+  - skills/angular_upgrade.yaml — Added variables section, updated conditions
+  - skills/story_implementation.yaml — Added variables section
+  - skills/test_generation.yaml — Added variables section
+
+NEW TESTS:
+  - tests/test_three_layer_planning.py — Full coverage of all three layers
+
+KEY DESIGN DECISIONS:
+  ✓ ConditionEvaluator is 100% technology-agnostic
+  ✓ All technology knowledge lives in skill YAML variables and conditions
+  ✓ LLM suggestions are tagged with source for audit trail
+  ✓ Layers 2 and 3 are independently toggleable in config
+  ✓ Backward compatible with v2 — disabling layers gives identical v2 behavior
+```
+
+## PROMPT END
