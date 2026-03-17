@@ -1,6 +1,4 @@
-(No subject)
-R, Sunil Kumar<SunilKumar.R@fmr.com>
-​You​
+​
 # Autonomous AI Coding Agent Framework
 
  
