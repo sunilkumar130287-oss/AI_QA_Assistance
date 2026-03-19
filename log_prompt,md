@@ -1,0 +1,179 @@
+You are a senior enterprise AI platform engineer.
+
+Your task is to enhance the existing autonomous agent framework codebase to produce DEMO-READY, EXECUTIVE-LEVEL structured logs and explainability outputs.
+
+This is NOT just logging. This is an "Execution Audit & Explainability Layer".
+
+--------------------------------------------------
+🎯 OBJECTIVE
+--------------------------------------------------
+
+Transform the current logging system into a structured, human-readable, and demo-friendly execution trace that clearly shows:
+
+1. WHAT the system is doing
+2. WHY it is doing it
+3. WHAT decisions were made
+4. WHAT failed and how it was fixed
+5. FINAL OUTCOME with confidence
+
+--------------------------------------------------
+📦 OUTPUT REQUIREMENTS
+--------------------------------------------------
+
+The system must print a clean, structured execution summary in the console AND save JSON logs.
+
+The output should look like:
+
+==================================================
+🚀 AI SDLC EXECUTION SUMMARY
+==================================================
+
+📌 Task: <task_name>
+📌 Jira: <jira_id>
+
+🧠 Context Understanding:
+- Requirements extracted: <count>
+- Key modules identified: [list]
+
+🔍 Codebase Analysis:
+- Tech Stack: <stack>
+- Modules impacted: [list]
+
+📋 Execution Plan:
+1. Step 1
+2. Step 2
+...
+
+🧪 Tests (ATDD):
+- Tests written: <count>
+- Initial status: FAILED
+
+⚙️ Implementation:
+- Files modified: <count>
+- Key changes: [short summary]
+
+🔁 Retry Loop:
+- Attempts: <count>
+- Issues fixed:
+  - Issue 1
+  - Issue 2
+
+✅ Validation:
+- Build: SUCCESS / FAILED
+- Tests: X/Y passed
+
+⚠️ Risks:
+- <list>
+
+📊 Confidence Score: <0-100>
+
+📦 PR:
+- Branch: <name>
+- Status: CREATED
+
+==================================================
+
+--------------------------------------------------
+🧱 IMPLEMENTATION INSTRUCTIONS
+--------------------------------------------------
+
+1. Enhance PipelineState (core/state.py):
+   - Add fields:
+     - execution_plan
+     - modules_analyzed
+     - tests_written
+     - retry_count
+     - issues_found
+     - issues_fixed
+     - files_modified
+     - risk_flags
+     - confidence_score
+
+2. Modify core/orchestrator.py:
+   - Capture outputs from each agent and store in PipelineState
+   - Track:
+     - each stage start/end
+     - failures and retries
+     - tool usage summary
+
+3. Enhance logger (core/logger.py):
+   - Add structured logging method:
+     - log_stage(stage_name, summary_dict)
+   - Add final_summary(state) method
+
+4. Update ALL agents:
+   - context_agent → populate requirements + summary
+   - repo_agent → modules + tech stack
+   - planner_agent → execution plan
+   - test_agent → tests written
+   - coder_agent → files modified + changes
+   - reviewer_agent → issues + validation results
+
+5. Retry Tracking:
+   - Increment retry_count in state
+   - Capture each failure reason
+   - Capture fix applied
+
+6. Confidence Score (simple heuristic):
+   - Start with 100
+   - Deduct:
+     - -10 per retry
+     - -20 if tests initially failed
+     - -15 if build failed once
+   - Store in state
+
+7. Risk Detection:
+   - If core files modified → add "HIGH RISK"
+   - If many retries → add "MEDIUM RISK"
+
+8. Output Layer:
+   - Print formatted summary (as shown above)
+   - Save JSON:
+     workspace/<jira>/execution_summary.json
+
+--------------------------------------------------
+🎯 DEMO OPTIMIZATION RULES
+--------------------------------------------------
+
+- Output must be readable by non-engineers
+- Avoid raw stack traces in final summary
+- Highlight:
+  - retries
+  - fixes
+  - validations
+- Keep sections visually separated
+- Use emojis/icons for clarity
+
+--------------------------------------------------
+🚫 DO NOT
+--------------------------------------------------
+
+- Do NOT change core agent logic
+- Do NOT break existing pipeline
+- Do NOT introduce heavy dependencies
+
+--------------------------------------------------
+✅ SUCCESS CRITERIA
+--------------------------------------------------
+
+After implementation, running:
+
+python main.py --jira TEST-123 --repo <repo> --task java_21_upgrade
+
+Should produce:
+
+- Clean execution summary in console
+- JSON audit file
+- Clear visibility into:
+  - plan
+  - execution
+  - failures
+  - fixes
+  - final outcome
+
+--------------------------------------------------
+
+Proceed to:
+1. Identify exact files to modify
+2. Provide code changes (diff style preferred)
+3. Ensure backward compatibility
